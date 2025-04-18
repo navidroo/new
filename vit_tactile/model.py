@@ -42,11 +42,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple, List, Union
-from fast_transformers.builders import TransformerEncoderBuilder
-from fast_transformers.builders import AttentionBuilder
-from fast_transformers.feature_maps import Favor
+import math
 from einops import rearrange
-from einops.layers.torch import Rearrange
 
 
 class ExitHead(nn.Module):
@@ -95,6 +92,218 @@ class PatchEmbed(nn.Module):
         return x
 
 
+# Orthogonal random features for Performer attention
+def orthogonal_matrix_chunk(cols, device=None):
+    """Creates a random orthogonal matrix chunk."""
+    unstructured_block = torch.randn((cols, cols), device=device)
+    q, r = torch.qr(unstructured_block)
+    return q
+
+
+def gaussian_orthogonal_random_matrix(n_rows, n_cols, scaling=0, device=None):
+    """Creates a random orthogonal matrix with Gaussian values."""
+    nb_full_blocks = int(n_rows / n_cols)
+    block_list = []
+    
+    for _ in range(nb_full_blocks):
+        q = orthogonal_matrix_chunk(n_cols, device=device)
+        block_list.append(q)
+    
+    remaining_rows = n_rows - nb_full_blocks * n_cols
+    if remaining_rows > 0:
+        q = orthogonal_matrix_chunk(n_cols, device=device)
+        block_list.append(q[:remaining_rows])
+    
+    final_matrix = torch.cat(block_list)
+    
+    if scaling == 0:
+        multiplier = torch.randn((n_rows, 1), device=device).norm(dim=1)
+    elif scaling == 1:
+        multiplier = math.sqrt((float(n_cols))) * torch.ones((n_rows,), device=device)
+    else:
+        raise ValueError(f"Invalid scaling {scaling}")
+    
+    return torch.diag(multiplier) @ final_matrix
+
+
+class PerformerAttention(nn.Module):
+    """Performer attention mechanism using random projections."""
+    
+    def __init__(
+        self, 
+        dim, 
+        num_heads=8, 
+        qkv_bias=False, 
+        qk_scale=None, 
+        attn_drop=0., 
+        proj_drop=0.,
+        feature_dim=256,
+        kernel_type="exp"
+    ):
+        super().__init__()
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = qk_scale or head_dim ** -0.5
+        
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+        
+        self.feature_dim = feature_dim
+        self.kernel_type = kernel_type
+        self.head_dim = head_dim
+        
+        # Initialize random projection matrices
+        if self.kernel_type == "exp":
+            self.create_projection = lambda device: gaussian_orthogonal_random_matrix(
+                n_rows=self.feature_dim, n_cols=self.head_dim, scaling=0, device=device
+            )
+        else:
+            raise NotImplementedError(f"Kernel type {kernel_type} not implemented")
+            
+        # Initialize projection matrix for each head
+        self.register_buffer("projection_matrix", self.create_projection(None))
+    
+    def forward(self, x):
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]  # (B, H, N, D)
+        
+        # Get projection matrix for the current batch
+        if self.projection_matrix is None or self.projection_matrix.device != x.device:
+            self.projection_matrix = self.create_projection(x.device)
+            
+        # Apply random projection to queries and keys
+        proj_q = self.feature_map(q, self.projection_matrix)  # (B, H, N, F)
+        proj_k = self.feature_map(k, self.projection_matrix)  # (B, H, N, F)
+        
+        # Linear attention
+        k_cumsum = proj_k.sum(dim=2, keepdim=True)  # (B, H, 1, F)
+        D_inv = 1. / torch.einsum('...nd,...d->...n', proj_q, k_cumsum.squeeze(2))  # (B, H, N)
+        
+        # Compute attention
+        context = torch.einsum('...nf,...mf->...nm', proj_q, proj_k)  # (B, H, N, N)
+        context = torch.einsum('...nm,...md->...nd', context, v)  # (B, H, N, D)
+        
+        # Scale by D_inv
+        context = torch.einsum('...nd,...n->...nd', context, D_inv)  # (B, H, N, D)
+        
+        # Reshape to original dimensions
+        context = context.permute(0, 2, 1, 3).reshape(B, N, C)  # (B, N, C)
+        
+        # Project to output dimension
+        x = self.proj(context)
+        x = self.proj_drop(x)
+        
+        return x
+    
+    def feature_map(self, x, projection_matrix):
+        """Apply feature map to input based on the kernel type."""
+        if self.kernel_type == "exp":
+            # Explicit feature map for e^{qk^T/sqrt(d)}
+            projection = torch.einsum('...nd,...df->...nf', x, projection_matrix)
+            return torch.exp(projection - torch.square(x).sum(dim=-1, keepdim=True) / 2) * (self.head_dim ** -0.25)
+        else:
+            raise NotImplementedError(f"Kernel type {self.kernel_type} not implemented")
+
+
+class Mlp(nn.Module):
+    """MLP as used in Vision Transformer, MLP-Mixer and related networks."""
+    
+    def __init__(
+        self,
+        in_features,
+        hidden_features=None,
+        out_features=None,
+        act_layer=nn.GELU,
+        drop=0.,
+    ):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        
+        self.fc1 = nn.Linear(in_features, hidden_features)
+        self.act = act_layer()
+        self.fc2 = nn.Linear(hidden_features, out_features)
+        self.drop = nn.Dropout(drop)
+    
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.drop(x)
+        return x
+
+
+class Block(nn.Module):
+    """Transformer Block with Performer Attention."""
+    
+    def __init__(
+        self,
+        dim,
+        num_heads,
+        mlp_ratio=4.,
+        qkv_bias=False,
+        qk_scale=None,
+        drop=0.,
+        attn_drop=0.,
+        drop_path=0.,
+        act_layer=nn.GELU,
+        norm_layer=nn.LayerNorm,
+        feature_dim=256,
+    ):
+        super().__init__()
+        self.norm1 = norm_layer(dim)
+        self.attn = PerformerAttention(
+            dim=dim,
+            num_heads=num_heads,
+            qkv_bias=qkv_bias,
+            qk_scale=qk_scale,
+            attn_drop=attn_drop,
+            proj_drop=drop,
+            feature_dim=feature_dim,
+        )
+        
+        # Drop path (stochastic depth)
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        
+        self.norm2 = norm_layer(dim)
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        self.mlp = Mlp(
+            in_features=dim,
+            hidden_features=mlp_hidden_dim,
+            act_layer=act_layer,
+            drop=drop,
+        )
+    
+    def forward(self, x):
+        x = x + self.drop_path(self.attn(self.norm1(x)))
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
+        return x
+
+
+class DropPath(nn.Module):
+    """Drop paths (Stochastic Depth) per sample."""
+    
+    def __init__(self, drop_prob=0.):
+        super(DropPath, self).__init__()
+        self.drop_prob = drop_prob
+    
+    def forward(self, x):
+        if self.drop_prob == 0. or not self.training:
+            return x
+        
+        keep_prob = 1 - self.drop_prob
+        # Work with different rank tensors: B, ..., *dims
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+        random_tensor.floor_()  # binarize
+        output = x.div(keep_prob) * random_tensor
+        return output
+
+
 class PerformerViTTactile(nn.Module):
     """
     ViT-Tiny with Performer attention and dynamic early-exit heads.
@@ -141,40 +350,25 @@ class PerformerViTTactile(nn.Module):
             ExitHead(embed_dim, num_classes) for _ in range(len(exit_idxs))
         ])
         
-        # Initialize Performer transformer blocks
-        self.blocks = nn.ModuleList()
+        # Stochastic depth decay rule
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
         
-        # Create Performer attention builder
-        attention_builder = AttentionBuilder.from_kwargs(
-            attention_dropout=attn_drop_rate,
-            attention_type="linear",
-            feature_map=Favor(n_dims=feature_map_dim)
-        )
-        
-        # Create builder for each transformer block
-        builder = TransformerEncoderBuilder.from_kwargs(
-            attention_builder=attention_builder,
-            n_layers=depth,
-            n_heads=num_heads,
-            feed_forward_dimensions=int(embed_dim * mlp_ratio),
-            query_dimensions=embed_dim // num_heads,
-            value_dimensions=embed_dim // num_heads,
-            dropout=drop_rate,
-        )
-        
-        # We need to handle each block individually for early-exit
-        for i in range(depth):
-            # Create a single-layer transformer
-            single_layer_builder = TransformerEncoderBuilder.from_kwargs(
-                attention_builder=attention_builder,
-                n_layers=1,
-                n_heads=num_heads,
-                feed_forward_dimensions=int(embed_dim * mlp_ratio),
-                query_dimensions=embed_dim // num_heads,
-                value_dimensions=embed_dim // num_heads,
-                dropout=drop_rate,
+        # Build transformer blocks
+        self.blocks = nn.ModuleList([
+            Block(
+                dim=embed_dim,
+                num_heads=num_heads,
+                mlp_ratio=mlp_ratio,
+                qkv_bias=True,
+                qk_scale=None,
+                drop=drop_rate,
+                attn_drop=attn_drop_rate,
+                drop_path=dpr[i],
+                norm_layer=norm_layer,
+                feature_dim=feature_map_dim,
             )
-            self.blocks.append(single_layer_builder.get())
+            for i in range(depth)
+        ])
         
         self.norm = norm_layer(embed_dim)
         
@@ -182,11 +376,17 @@ class PerformerViTTactile(nn.Module):
         self.head = nn.Linear(embed_dim, num_classes) if num_classes > 0 else nn.Identity()
         
         # Initialize weights
+        self._init_weights()
+    
+    def _init_weights(self):
+        # Initialize pos_embed and cls_token
         nn.init.trunc_normal_(self.pos_embed, std=0.02)
         nn.init.trunc_normal_(self.cls_token, std=0.02)
-        self.apply(self._init_weights)
+        
+        # Initialize all other weights
+        self.apply(self._init_weights_recursive)
     
-    def _init_weights(self, m):
+    def _init_weights_recursive(self, m):
         if isinstance(m, nn.Linear):
             nn.init.trunc_normal_(m.weight, std=0.02)
             if m.bias is not None:
