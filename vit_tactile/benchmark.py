@@ -54,8 +54,9 @@ def measure_inference_time(model, data_batches, device):
         for _ in range(3):
             _ = model(data_batches[0].to(device))
     
-    # Sync before measuring time
-    torch.cuda.synchronize()
+    # Sync before measuring time (only if using CUDA)
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
     
     # Measure time for each batch
     batch_times = []
@@ -65,8 +66,9 @@ def measure_inference_time(model, data_batches, device):
         for batch in tqdm(data_batches, desc="Measuring inference time"):
             batch = batch.to(device)
             
-            # Sync before batch
-            torch.cuda.synchronize()
+            # Sync before batch (only if using CUDA)
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
             start_time = time.time()
             
             # Forward pass
@@ -77,8 +79,9 @@ def measure_inference_time(model, data_batches, device):
                 logits, exit_idx = outputs
                 early_exit_indices.append(exit_idx)
             
-            # Sync after batch
-            torch.cuda.synchronize()
+            # Sync after batch (only if using CUDA)
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
             end_time = time.time()
             
             batch_times.append(end_time - start_time)
@@ -113,6 +116,10 @@ def measure_peak_memory(model, data_batch, device):
     """Measure peak GPU memory usage during inference."""
     model.eval()
     model.to(device)
+    
+    # Only measure GPU memory if using CUDA
+    if device.type != 'cuda':
+        return 0.0  # Return 0 for CPU usage (we can't easily measure CPU memory)
     
     # Clear cache
     torch.cuda.empty_cache()
@@ -165,7 +172,12 @@ def benchmark(args):
     
     # Calculate improvement
     time_improvement = (standard_stats["avg_time_per_batch"] - performer_stats["avg_time_per_batch"]) / standard_stats["avg_time_per_batch"] * 100
-    memory_improvement = (standard_memory - performer_memory) / standard_memory * 100
+    
+    # Only calculate memory improvement if memory data is available (i.e., on GPU)
+    if standard_memory > 0 and performer_memory > 0:
+        memory_improvement = (standard_memory - performer_memory) / standard_memory * 100
+    else:
+        memory_improvement = 0.0  # No memory data available in CPU mode
     
     # Print results
     print("\n" + "="*50)
@@ -174,15 +186,24 @@ def benchmark(args):
     
     print(f"\nStandard ViT-Tiny:")
     print(f"  Avg. time per batch: {standard_stats['avg_time_per_batch']*1000:.2f} ms")
-    print(f"  Peak memory: {standard_memory:.2f} MB")
+    if standard_memory > 0:
+        print(f"  Peak memory: {standard_memory:.2f} MB")
+    else:
+        print("  Peak memory: Not available in CPU mode")
     
     print(f"\nPerformer ViT-Tiny with Early-Exit (tau={args.tau}):")
     print(f"  Avg. time per batch: {performer_stats['avg_time_per_batch']*1000:.2f} ms")
-    print(f"  Peak memory: {performer_memory:.2f} MB")
+    if performer_memory > 0:
+        print(f"  Peak memory: {performer_memory:.2f} MB")
+    else:
+        print("  Peak memory: Not available in CPU mode")
     
     print(f"\nImprovement:")
     print(f"  Time: {time_improvement:.2f}%")
-    print(f"  Memory: {memory_improvement:.2f}%")
+    if standard_memory > 0 and performer_memory > 0:
+        print(f"  Memory: {memory_improvement:.2f}%")
+    else:
+        print("  Memory: Not available in CPU mode")
     
     if performer_stats["exit_stats"]:
         print(f"\nEarly-Exit Statistics:")
@@ -202,17 +223,17 @@ def benchmark(args):
         "standard_vit": {
             "avg_time_ms": standard_stats["avg_time_per_batch"] * 1000,
             "std_time_ms": standard_stats["std_time"] * 1000,
-            "peak_memory_mb": standard_memory
+            "peak_memory_mb": standard_memory if standard_memory > 0 else None
         },
         "performer_vit": {
             "avg_time_ms": performer_stats["avg_time_per_batch"] * 1000,
             "std_time_ms": performer_stats["std_time"] * 1000,
-            "peak_memory_mb": performer_memory,
+            "peak_memory_mb": performer_memory if performer_memory > 0 else None,
             "exit_stats": performer_stats["exit_stats"]
         },
         "improvement": {
             "time_percent": time_improvement,
-            "memory_percent": memory_improvement
+            "memory_percent": memory_improvement if standard_memory > 0 and performer_memory > 0 else None
         }
     }
     

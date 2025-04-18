@@ -1,7 +1,7 @@
 # PyTorch must be installed first before other dependencies
 torch==2.1.2
 torchvision==0.16.2
-numpy>=1.24.0
+numpy>=1.24.0,<2.0.0
 matplotlib>=3.7.0
 tqdm>=4.66.0
 einops>=0.6.0

@@ -96,7 +96,7 @@ class PatchEmbed(nn.Module):
 def orthogonal_matrix_chunk(cols, device=None):
     """Creates a random orthogonal matrix chunk."""
     unstructured_block = torch.randn((cols, cols), device=device)
-    q, r = torch.qr(unstructured_block)
+    q, r = torch.linalg.qr(unstructured_block, 'reduced')
     return q
 
 
