@@ -154,56 +154,63 @@ class PerformerAttention(nn.Module):
         self.kernel_type = kernel_type
         self.head_dim = head_dim
         
-        # Initialize random projection matrices
-        if self.kernel_type == "exp":
-            self.create_projection = lambda device: gaussian_orthogonal_random_matrix(
-                n_rows=self.feature_dim, n_cols=self.head_dim, scaling=0, device=device
-            )
-        else:
-            raise NotImplementedError(f"Kernel type {kernel_type} not implemented")
-            
-        # Initialize projection matrix for each head
-        self.register_buffer("projection_matrix", self.create_projection(None))
+        # Initialize projection matrix
+        # We'll create it on the first forward pass to ensure it's on the right device
+        self.projection_matrix = None
     
     def forward(self, x):
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]  # (B, H, N, D)
         
-        # Get projection matrix for the current batch
+        # Create or move projection matrix to the right device if needed
         if self.projection_matrix is None or self.projection_matrix.device != x.device:
-            self.projection_matrix = self.create_projection(x.device)
-            
+            self.projection_matrix = gaussian_orthogonal_random_matrix(
+                n_rows=self.feature_dim,
+                n_cols=self.head_dim,
+                scaling=0,
+                device=x.device
+            )
+        
         # Apply random projection to queries and keys
-        proj_q = self.feature_map(q, self.projection_matrix)  # (B, H, N, F)
-        proj_k = self.feature_map(k, self.projection_matrix)  # (B, H, N, F)
+        proj_q = self.feature_map(q)  # (B, H, N, F)
+        proj_k = self.feature_map(k)  # (B, H, N, F)
         
         # Linear attention
-        k_cumsum = proj_k.sum(dim=2, keepdim=True)  # (B, H, 1, F)
-        D_inv = 1. / torch.einsum('...nd,...d->...n', proj_q, k_cumsum.squeeze(2))  # (B, H, N)
+        # (B, H, N, F) @ (B, H, F) -> (B, H, N)
+        k_cumsum = torch.sum(proj_k, dim=2)  # (B, H, F)
+        D_inv = 1.0 / torch.einsum('bhnd,bhd->bhn', proj_q, k_cumsum)  # (B, H, N)
         
         # Compute attention
-        context = torch.einsum('...nf,...mf->...nm', proj_q, proj_k)  # (B, H, N, N)
-        context = torch.einsum('...nm,...md->...nd', context, v)  # (B, H, N, D)
+        # (B, H, N, F) @ (B, H, M, F).transpose(-1, -2) -> (B, H, N, M)
+        attn = torch.einsum('bhnd,bhmd->bhnm', proj_q, proj_k)
         
-        # Scale by D_inv
-        context = torch.einsum('...nd,...n->...nd', context, D_inv)  # (B, H, N, D)
+        # Apply attention to values
+        # (B, H, N, M) @ (B, H, M, D) -> (B, H, N, D)
+        out = torch.einsum('bhnm,bhmd->bhnd', attn, v)
+        
+        # Scale by normalization factor
+        out = out * D_inv.unsqueeze(-1)  # (B, H, N, D)
         
         # Reshape to original dimensions
-        context = context.permute(0, 2, 1, 3).reshape(B, N, C)  # (B, N, C)
+        out = out.permute(0, 2, 1, 3).reshape(B, N, C)  # (B, N, C)
         
         # Project to output dimension
-        x = self.proj(context)
-        x = self.proj_drop(x)
+        out = self.proj(out)
+        out = self.proj_drop(out)
         
-        return x
+        return out
     
-    def feature_map(self, x, projection_matrix):
+    def feature_map(self, x):
         """Apply feature map to input based on the kernel type."""
         if self.kernel_type == "exp":
             # Explicit feature map for e^{qk^T/sqrt(d)}
-            projection = torch.einsum('...nd,...df->...nf', x, projection_matrix)
-            return torch.exp(projection - torch.square(x).sum(dim=-1, keepdim=True) / 2) * (self.head_dim ** -0.25)
+            # Project x from (B, H, N, D) to (B, H, N, F)
+            projection = torch.matmul(x, self.projection_matrix.t())
+            
+            # Normalize and apply exponential
+            norm_x = torch.sum(x**2, dim=-1, keepdim=True) / 2.0
+            return torch.exp(projection - norm_x) * (self.head_dim ** -0.25)
         else:
             raise NotImplementedError(f"Kernel type {self.kernel_type} not implemented")
 
