@@ -4,7 +4,11 @@ with open("vit_tactile/README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
 
 with open("vit_tactile/requirements.txt", "r", encoding="utf-8") as fh:
-    requirements = fh.read().splitlines()
+    requirements = [line for line in fh.read().splitlines() if not line.startswith('#')]
+
+# Ensure PyTorch is installed first
+install_requires = [req for req in requirements if req.startswith("torch")]
+install_requires.extend([req for req in requirements if not req.startswith("torch")])
 
 setup(
     name="vit_tactile",
@@ -22,5 +26,5 @@ setup(
         "Operating System :: OS Independent",
     ],
     python_requires=">=3.8",
-    install_requires=requirements,
+    install_requires=install_requires,
 )
